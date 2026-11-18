@@ -1,0 +1,12 @@
+# 打包中间产物
+build/
+*.spec
+
+# 本地临时/备份文件
+_new_block.py
+wps_print_当前版_WMI确认.py
+*_备份.py
+__pycache__/
+*.pyc
+
+# 说明：dist/批量打印.exe 是有意入库的（直接可用）
