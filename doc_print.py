@@ -200,7 +200,7 @@ def print_word(session, path, copies, orient):
             hide_print_dialogs()
             if n > 1:
                 time.sleep(1.0)
-        note = "已提交 %d 份" % n
+        note = "已发送 %d 份" % n
         if orient == "fitwidth":
             note += "（按一页宽缩放）"
         return note
@@ -372,7 +372,7 @@ def print_pdf(path, copies, orient, printer_name, dpi=PDF_RENDER_DPI):
                     dc.EndDoc()
             finally:
                 dc.DeleteDC()
-        note = "已提交 %d 份（%d 页）" % (max(1, int(copies)), doc.page_count)
+        note = "已发送 %d 份（%d 页）" % (max(1, int(copies)), doc.page_count)
         return note
     finally:
         doc.close()

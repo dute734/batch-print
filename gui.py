@@ -415,7 +415,7 @@ class PrintWorker(QThread):
         try:
             wps_print.print_batch(self.printer, self.items,
                                   lambda ev: self.event.emit(ev),
-                                  self.stop_flag, verify_seconds=8)
+                                  self.stop_flag, verify_seconds=0)
         except Exception as e:  # noqa: BLE001
             self.event.emit({"type": "fatal", "error": str(e)})
 
@@ -1050,7 +1050,9 @@ class MainWindow(QMainWindow):
     # ---------- 实时打印状态
     STATE_STYLE = {
         "待打印": ("#8b87a3", QColor(255, 255, 255, 0)),
+        "正在发送": ("#1f6fa8", QColor(150, 205, 246, 90)),
         "正在打印": ("#1f6fa8", QColor(150, 205, 246, 90)),
+        "已发送": ("#1f7a5b", QColor(150, 240, 200, 90)),
         "已打印": ("#1f7a5b", QColor(150, 240, 200, 90)),
         "已送出": ("#9a6a16", QColor(255, 224, 168, 120)),
         "失败": ("#a8323b", QColor(255, 190, 200, 110)),
@@ -1075,7 +1077,7 @@ class MainWindow(QMainWindow):
         item.setBackground(bg)
         item.setToolTip(note or state)
         font = item.font()
-        font.setBold(style_key in ("正在打印", "已打印"))
+        font.setBold(style_key in ("正在发送", "正在打印", "已发送", "已打印"))
         item.setFont(font)
 
     def _set_status(self, key, state, note=""):
@@ -1116,6 +1118,7 @@ class MainWindow(QMainWindow):
             for st in sheets.values():
                 st["print"] = on
         self._rebuild_table()
+        self._refresh_file_list()
 
     def _update_summary(self):
         sheets = copies = pages = 0
@@ -1181,8 +1184,8 @@ class MainWindow(QMainWindow):
         self.stop_btn.setVisible(True)
         self._printed = 0
         self._total_print = total
-        self.status_label.setText("正在打印 · 0/%d" % total)
-        self.print_btn.setText("打印中…")
+        self.status_label.setText("正在发送 · 0/%d" % total)
+        self.print_btn.setText("发送中…")
         self._append_log("开始打印，共 %d 项" % total)
         self.print_worker = PrintWorker(printer, items)
         self.print_worker.event.connect(self._on_print_event)
@@ -1202,8 +1205,8 @@ class MainWindow(QMainWindow):
         elif t == "sheet_begin":
             key = self.print_seq_keys.get(ev.get("seq"))
             if key:
-                self._set_status(key, "正在打印", "%d 份 · 已提交给打印机" % ev.get("copies", 1))
-            self.status_label.setText("正在打印 · 第 %d/%d 项：%s %s" % (
+                self._set_status(key, "正在发送", "%d 份 · 正在送往打印机" % ev.get("copies", 1))
+            self.status_label.setText("正在发送 · 第 %d/%d 项：%s %s" % (
                 ev.get("seq", 0), getattr(self, "_total_print", 0),
                 ev.get("file", ""), ev.get("sheet", "")))
         elif t == "sheet_tick":
@@ -1212,14 +1215,14 @@ class MainWindow(QMainWindow):
                 p, tot = ev.get("printed", 0), ev.get("pages", 0)
                 text = "正在打印 %d/%d页" % (p, tot) if tot else "正在打印"
                 self._set_status(key, text, "已出纸 %d / %d 页" % (p, tot))
-            self.status_label.setText("正在打印 · 第 %d/%d 项：%s %s" % (
+            self.status_label.setText("正在发送 · 第 %d/%d 项：%s %s" % (
                 ev.get("seq", 0), getattr(self, "_total_print", 0),
                 ev.get("file", ""), ev.get("sheet", "")))
         elif t in ("sheet_ok", "sheet_error"):
             key = self.print_seq_keys.get(ev.get("seq"))
             if key:
                 if t == "sheet_ok":
-                    state = "已打印" if ev.get("confirmed", True) else "已送出"
+                    state = "已发送"
                     self._set_status(key, state, ev.get("note", ""))
                     self._printed = getattr(self, "_printed", 0) + 1
                 else:
@@ -1230,7 +1233,7 @@ class MainWindow(QMainWindow):
                 self._append_log("%s %s · %s" % (ev.get("file", ""),
                                                 key[1] if key else ev.get("seq", ""),
                                                 ev.get("note", "")))
-            self.status_label.setText("正在打印 · 已完成 %d/%d" % (
+            self.status_label.setText("正在发送 · 已发送 %d/%d" % (
                 getattr(self, "_printed", 0), getattr(self, "_total_print", 0)))
         elif t == "file_error":
             self._append_log("文件打不开：%s —— %s" % (ev["file"], ev["error"]))
@@ -1248,11 +1251,11 @@ class MainWindow(QMainWindow):
             ok = getattr(self, "_printed", 0)
             total = getattr(self, "_total_print", 0)
             if t == "done":
-                self.status_label.setText("打印结束 · 成功 %d/%d" % (ok, total))
+                self.status_label.setText("全部发送完毕 · 已发送 %d/%d" % (ok, total))
             elif t == "stopped":
-                self.status_label.setText("已中止 · 成功 %d/%d" % (ok, total))
+                self.status_label.setText("已中止 · 已发送 %d/%d" % (ok, total))
             else:
-                self.status_label.setText("已中断 · 成功 %d/%d" % (ok, total))
+                self.status_label.setText("已中断 · 已发送 %d/%d" % (ok, total))
 
     def _append_log(self, msg):
         self.log.append("[%s] %s" % (time.strftime("%H:%M:%S"), msg))

@@ -624,8 +624,9 @@ def _print_excel_file(session, printer_name, item, seq, on_event, stop_flag, ver
                             time.sleep(0.4)
                             waited += 0.4
                     else:
-                        # 没有队列核验时也要给 WPS 一点喘息时间，避免连续 PrintOut 被合并成一份
-                        time.sleep(1.0)
+                        # 给 WPS 一点喘息时间，避免连续 PrintOut 被合并成一份（最后一份不用等）
+                        if _c < copies - 1:
+                            time.sleep(1.0)
                 # ---- 真正等出纸：本次提交的任务从队列消失才算打完
                 state, wnote = "ok", ""
                 if verify_seconds and new_ids:
@@ -637,7 +638,7 @@ def _print_excel_file(session, printer_name, item, seq, on_event, stop_flag, ver
                 elif verify_seconds:
                     # 没抓到任务号（空表等瞬间完成的情况）
                     state, wnote = "quick", ""
-                note = "已提交 %d 份" % copies
+                note = "已发送 %d 份" % copies
                 if verify_seconds:
                     if state == "ok":
                         note = "已打印完成（%d 份%s）" % (
@@ -666,6 +667,30 @@ def _print_excel_file(session, printer_name, item, seq, on_event, stop_flag, ver
         except Exception:
             pass
     return seq
+
+
+def _close_after_spool(printer_name, closers, max_wait=300.0):
+    """后台等打印队列空了再关 WPS，避免「已发送」后立刻退出把还没出纸的任务取消掉"""
+    sessions = [c for c in closers if c is not None]
+
+    def run():
+        t0 = time.time()
+        while time.time() - t0 < max_wait:
+            try:
+                if not job_state(printer_name):
+                    break
+            except Exception:
+                break
+            time.sleep(2.0)
+        time.sleep(1.0)
+        for s in sessions:
+            try:
+                s.quit()
+            except Exception:
+                pass
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
 
 
 def print_batch(printer_name, items, on_event, stop_flag=None, verify_seconds=0):
@@ -801,7 +826,4 @@ def print_batch(printer_name, items, on_event, stop_flag=None, verify_seconds=0)
         on_event({"type": "fatal", "error": str(e)})
     finally:
         guard.stop()
-        if session is not None:
-            session.quit()
-        if writer is not None:
-            writer.quit()
+        _close_after_spool(printer_name, [session, writer])
