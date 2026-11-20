@@ -522,6 +522,33 @@ class MainWindow(QMainWindow):
         self._load_printers()
         self._load_wps_badge()
 
+        # 队列只读轮询：每 2 秒扫一次打印队列，只显示“还有几项在排队”，不阻塞发送流程
+        self.queue_timer = QTimer(self)
+        self.queue_timer.setInterval(2000)
+        self.queue_timer.timeout.connect(self._poll_queue)
+        self.queue_timer.start()
+
+    def _poll_queue(self):
+        name = self.printer_combo.currentData() if hasattr(self, "printer_combo") else None
+        if not name:
+            self.queue_chip.setText("队列 —")
+            return
+        try:
+            jobs = wps_print.job_state(name) or {}
+            n = len(jobs)
+        except Exception:
+            self.queue_chip.setText("队列 ?")
+            return
+        if n <= 0:
+            self.queue_chip.setText("队列空闲")
+            self.queue_chip.setStyleSheet("color:#1f7a5b;")
+            self.queue_chip.setToolTip("打印队列已清空，纸已出完")
+        else:
+            pages = sum(int(v.get("pages") or 0) for v in jobs.values())
+            self.queue_chip.setText("排队 %d 项" % n)
+            self.queue_chip.setStyleSheet("color:#9a6a16;font-weight:600;")
+            self.queue_chip.setToolTip("还有 %d 个任务、约 %d 页在队列里（只读统计，不影响新任务发送）" % (n, pages))
+
     # ---------- UI 构建
     def _build_ui(self):
         holder = QWidget()
@@ -572,6 +599,10 @@ class MainWindow(QMainWindow):
         self.printer_state = QLabel("")
         self.printer_state.setObjectName("muted")
         row.addWidget(self.printer_state, 1)
+        self.queue_chip = QLabel("队列 —")
+        self.queue_chip.setObjectName("chip")
+        self.queue_chip.setToolTip("打印机队列里还有多少任务在排队（只读，不影响发送）")
+        row.addWidget(self.queue_chip, 0)
         outer.addWidget(card)
 
         # ============ 区域① 导入文件（可上下自由拖高）
@@ -795,6 +826,7 @@ class MainWindow(QMainWindow):
             self.printer_state.setText("虚拟打印机：会弹「另存为」，不适合批量")
         else:
             self.printer_state.setText("端口 %s · 状态 %s" % (p["port"] or "?", p["status_text"]))
+        self._poll_queue()
 
     def _load_wps_badge(self):
         info = None
