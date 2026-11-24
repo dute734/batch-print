@@ -512,6 +512,8 @@ class MainWindow(QMainWindow):
         self.seq = 0
         self.print_worker = None
         self.inspect_worker = None
+        self._inspect_queue = []     # 待读取的文件（串行，防崩）
+        self._rebuild_timer = None
         self.row_map = {}        # row -> (fid, sheet)
         self.status_rows = {}    # (fid, sheet) -> row
         self.print_seq_keys = {}  # 打印序号 -> (fid, sheet)
@@ -931,6 +933,7 @@ class MainWindow(QMainWindow):
         self.files = [f for f in self.files if f["id"] not in ids]
         for i in ids:
             self.settings.pop(i, None)
+        self._inspect_queue = [q for q in self._inspect_queue if q[0] not in ids]
         self._refresh_file_list()
         self._rebuild_table()
         self._update_summary()
@@ -938,6 +941,7 @@ class MainWindow(QMainWindow):
             len(names), "、".join(names[:3]) + ("…" if len(names) > 3 else "")))
 
     def _clear_files(self):
+        self._inspect_queue = []
         self.files = []
         self.settings = {}
         self.row_map = {}
@@ -947,11 +951,28 @@ class MainWindow(QMainWindow):
 
     # ---------- 读工作表
     def _inspect(self, ids):
-        pairs = [(fid, next(f for f in self.files if f["id"] == fid)["path"],
-                  next(f for f in self.files if f["id"] == fid)["kind"]) for fid in ids]
-        self.status_label.setText("正在读取文件内容…")
+        for fid in ids:
+            rec = next((f for f in self.files if f["id"] == fid), None)
+            if rec is None:
+                continue
+            self._inspect_queue.append((fid, rec["path"], rec["kind"]))
+        self.status_label.setText("正在读取文件内容…%d 个待读" % len(self._inspect_queue))
         self.print_btn.setEnabled(False)
-        self.inspect_worker = InspectWorker(pairs)
+        self._pump_inspect()
+
+    def _pump_inspect(self):
+        """同一时刻只跑一个读取线程，一批最多 12 个文件，读完自动接下一批。
+        这样连着拖好几次、或者一次拖几十个文件时，不会出现「线程还没结束就被替换」的闪退。"""
+        running = getattr(self, "inspect_worker", None)
+        if running is not None and running.isRunning():
+            return
+        if not self._inspect_queue:
+            self.status_label.setText("就绪")
+            self.print_btn.setEnabled(True)
+            return
+        batch = self._inspect_queue[:12]
+        del self._inspect_queue[:12]
+        self.inspect_worker = InspectWorker(batch)
         self.inspect_worker.fileReady.connect(self._on_file_inspected)
         self.inspect_worker.error.connect(lambda msg: self._append_log("读取失败：%s" % msg))
         self.inspect_worker.finishedAll.connect(self._on_inspect_finished)
@@ -965,15 +986,32 @@ class MainWindow(QMainWindow):
         rec["sheets"] = data["sheets"]
         rec["error"] = data.get("error")
         rec["chart_sheets"] = data.get("chart_sheets", 0)
+        rec["blank_pages"] = data.get("blank_pages") or []
         rec["inspected"] = True
         self._refresh_file_list()
+        self._schedule_rebuild()
+
+    def _schedule_rebuild(self):
+        """把「重建表格」合并成一次：一次拖几十个文件时不会每读一个文件就重造整张表"""
+        if getattr(self, "_rebuild_timer", None) is None:
+            self._rebuild_timer = QTimer(self)
+            self._rebuild_timer.setSingleShot(True)
+            self._rebuild_timer.timeout.connect(self._flush_rebuild)
+        self._rebuild_timer.start(250)
+
+    def _flush_rebuild(self):
         self._rebuild_table()
+        self._refresh_file_list()
+        self._update_summary()
 
     def _on_inspect_finished(self):
+        self._flush_rebuild()
+        if getattr(self, "_inspect_queue", None):
+            self.status_label.setText("正在读取文件内容…还剩 %d 个" % len(self._inspect_queue))
+            self._pump_inspect()
+            return
         self.status_label.setText("就绪")
         self.print_btn.setEnabled(True)
-        self._rebuild_table()
-        self._update_summary()
 
     # ---------- 文件列表
     def _refresh_file_list(self):
@@ -1029,7 +1067,8 @@ class MainWindow(QMainWindow):
             if not f["inspected"] or f["error"]:
                 continue
             for s in f["sheets"]:
-                default_on = s.get("visible") not in ("隐藏", "深度隐藏")
+                default_on = (s.get("visible") not in ("隐藏", "深度隐藏")
+                              and not s.get("blank"))
                 st = self.settings.setdefault(f["id"], {}).setdefault(
                     s["name"], {"print": default_on, "copies": 1, "orient": "keep"})
                 rows.append((f, s, st))
@@ -1049,12 +1088,21 @@ class MainWindow(QMainWindow):
             name_item.setToolTip(f["path"])
             self.table.setItem(i, 1, name_item)
             content = s["name"]
+            if s.get("blank"):
+                content += "（空白，默认不打印）"
             if s.get("visible") in ("隐藏", "深度隐藏"):
                 content += "（隐藏）"
+            blanks = f.get("blank_pages") or []
+            if blanks and f.get("kind") in ("word", "pdf"):
+                content += "（跳过 %d 页空白）" % len(blanks)
             content_item = QTableWidgetItem(content)
             content_item.setToolTip(s.get("note") or "")
             self.table.setItem(i, 2, content_item)
-            pages = "—" if s["pages"] is None else str(s["pages"])
+            pages = s["pages"]
+            if pages is not None and blanks and f.get("kind") in ("word", "pdf"):
+                real = max(0, int(pages) - len(blanks))
+                pages = "%d→%d" % (pages, real)
+            pages = "—" if pages is None else str(pages)
             pages_item = QTableWidgetItem(pages)
             pages_item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(i, 3, pages_item)
@@ -1165,6 +1213,13 @@ class MainWindow(QMainWindow):
                 sheets += 1
                 copies += st["copies"]
                 pages += (s["pages"] or 0) * st["copies"]
+        # 有空白页被跳过的文件，按实际要打的页数算
+        for f in self.files:
+            if f.get("kind") in ("word", "pdf") and f.get("blank_pages"):
+                for s in f["sheets"]:
+                    st = self.settings.get(f["id"], {}).get(s["name"])
+                    if st and st["print"]:
+                        pages -= min(len(f["blank_pages"]), s["pages"] or 0) * st["copies"]
         self.stat_line.setText("已选 %d · 份数 %d · 页数 %s" % (
             sheets, copies, pages if pages else "—"))
 
@@ -1180,6 +1235,7 @@ class MainWindow(QMainWindow):
                 "path": f["path"],
                 "kind": f.get("kind", "excel"),
                 "fid": f["id"],
+                "blank_pages": f.get("blank_pages") or [],
                 "sheets": [{"name": s["name"],
                             "copies": self.settings[f["id"]][s["name"]]["copies"],
                             "orientation": self.settings[f["id"]][s["name"]]["orient"]}

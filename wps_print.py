@@ -381,12 +381,22 @@ def inspect_workbook(session, path):
                 used = ws.UsedRange
                 item["rows"] = int(used.Rows.Count)
                 item["cols"] = int(used.Columns.Count)
-                if item["rows"] and item["rows"] <= 1 and item["cols"] and item["cols"] <= 1:
-                    rng = used.Cells(1, 1)
-                    if rng.Value in (None, ""):
-                        item["note"] = "空白表"
             except Exception:
                 pass
+            # 空白表判定：整张表没有任何非空单元格（CountA 为 0）
+            try:
+                cnt = int(wb.Application.WorksheetFunction.CountA(ws.Cells))
+                item["blank"] = (cnt == 0)
+            except Exception:
+                try:
+                    used = ws.UsedRange
+                    item["blank"] = bool(
+                        int(used.Rows.Count) <= 1 and int(used.Columns.Count) <= 1
+                        and used.Cells(1, 1).Value in (None, ""))
+                except Exception:
+                    item["blank"] = False
+            if item.get("blank"):
+                item["note"] = "空白表（没有任何内容），默认不打印"
             if item["visible"] != "可见":
                 item["note"] = (item["note"] + " " if item["note"] else "") + "该表已隐藏，打印前会自动临时显示"
             data["sheets"].append(item)
@@ -755,7 +765,7 @@ def print_batch(printer_name, items, on_event, stop_flag=None, verify_seconds=0)
                               "sheet": label, "copies": copies, "orientation": mode})
                     try:
                         base_ids = {j["id"] for j in _jobs_on(printer_name)} if verify_seconds else set()
-                        note = doc_print.print_word(writer, path, copies, mode)
+                        note = doc_print.print_word(writer, path, copies, mode, item.get("blank_pages"), printer_name)
                         state = "ok"
                         if verify_seconds:
                             hide_print_dialogs()
@@ -800,7 +810,7 @@ def print_batch(printer_name, items, on_event, stop_flag=None, verify_seconds=0)
                               "sheet": label, "copies": copies, "orientation": mode})
                     try:
                         base_ids = {j["id"] for j in _jobs_on(printer_name)} if verify_seconds else set()
-                        note = doc_print.print_pdf(path, copies, mode, printer_name)
+                        note = doc_print.print_pdf(path, copies, mode, printer_name, blank_pages=item.get("blank_pages"))
                         state = "ok"
                         if verify_seconds:
                             state, wnote = wait_spool_done(

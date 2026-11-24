@@ -136,9 +136,73 @@ class WpsWriterSession:
         self._uninit()
 
 
+def _word_blank_pages(doc, pages):
+    """找出没有文字的页（空白页）；返回 [页码,...]（1 起）
+
+    做法：逐段落读它所在页码（Range.Information(3) = wdActiveEndPageNumber），
+    把该段的可见字符累加到页码上；再叠加锚定在该页的图片/图形，都没内容的页算空白。
+    """
+    text_len = {}
+    try:
+        for para in doc.Paragraphs:
+            try:
+                rng = para.Range
+                pg = int(rng.Information(3))
+            except Exception:
+                continue
+            try:
+                t = (rng.Text or "").strip()
+            except Exception:
+                t = ""
+            if t:
+                text_len[pg] = text_len.get(pg, 0) + len(t)
+    except Exception:
+        return []
+
+    shape_pages = set()
+    for coll in ("InlineShapes", "Shapes"):
+        try:
+            items = getattr(doc, coll)
+            for k in range(1, int(items.Count) + 1):
+                try:
+                    anchor = items(k).Anchor if coll == "Shapes" else items(k).Range
+                    shape_pages.add(int(anchor.Information(3)))
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    blanks = []
+    for p in range(1, int(pages) + 1):
+        if text_len.get(p, 0) == 0 and p not in shape_pages:
+            blanks.append(p)
+    # 整篇都空就别报了，交给调用方判断
+    if len(blanks) >= int(pages):
+        return []
+    return blanks
+
+
+def _pages_range_text(pages, blanks, total):
+    """把「要打印的页」转成 PrintOut 的 PageRanges 字符串（如 1,3-5）；全要打就返回空串"""
+    keep = [p for p in range(1, int(total) + 1) if p not in set(blanks or ())]
+    if not keep or len(keep) == int(total):
+        return ""
+    parts = []
+    start = prev = keep[0]
+    for p in keep[1:]:
+        if p == prev + 1:
+            prev = p
+            continue
+        parts.append("%d" % start if start == prev else "%d-%d" % (start, prev))
+        start = prev = p
+    parts.append("%d" % start if start == prev else "%d-%d" % (start, prev))
+    return ",".join(parts)
+
+
 def inspect_word(session, path):
     """Word 文档没有工作表概念，整篇作为一条内容"""
-    data = {"path": path, "name": os.path.basename(path), "sheets": [], "error": None}
+    data = {"path": path, "name": os.path.basename(path), "sheets": [], "error": None,
+            "blank_pages": []}
     doc = None
     try:
         doc = session.open(path)
@@ -151,6 +215,12 @@ def inspect_word(session, path):
             orient = int(doc.PageSetup.Orientation)
         except Exception:
             orient = WD_ORIENT_PORTRAIT
+        blanks = _word_blank_pages(doc, pages) if pages else []
+        data["blank_pages"] = blanks
+        note = "Word 文档按整篇打印"
+        if blanks:
+            note = "共 %d 页，第 %s 页是空白页（自动跳过）" % (
+                pages, "、".join(str(p) for p in blanks))
         data["sheets"].append({
             "index": 1,
             "name": "整篇文档",
@@ -160,7 +230,7 @@ def inspect_word(session, path):
             "print_area": "",
             "rows": None,
             "cols": None,
-            "note": "Word 文档按整篇打印",
+            "note": note,
         })
     except Exception as e:  # noqa: BLE001
         data["error"] = str(e)
@@ -173,36 +243,83 @@ def inspect_word(session, path):
     return data
 
 
-def print_word(session, path, copies, orient):
+def print_word(session, path, copies, orient, blank_pages=None, printer_name=None):
     """打印整篇 Word；返回说明文字
 
     注意：WPS 文字的 PrintOut(Copies=n) 参数不可靠（实测只出 1 份），
     所以这里统一按「每次 1 份、循环 n 次」提交，和表格的份数处理保持一致。
+    blank_pages 里的页码不打印：WPS 文字实测不认 PageRanges / From-To，
+    所以有空白页时先导出成临时 PDF，再按 PDF 的页面逐页送打印机（真跳页）。
     """
     import time
     from wps_print import hide_print_dialogs
 
     n = max(1, int(copies))
     doc = None
+    blanks = list(blank_pages or [])
+    total = 0
     try:
         doc = session.open(path)
         if orient == "landscape":
             doc.PageSetup.Orientation = WD_ORIENT_LANDSCAPE
         elif orient == "portrait":
             doc.PageSetup.Orientation = WD_ORIENT_PORTRAIT
+        try:
+            total = int(doc.ComputeStatistics(WD_STAT_PAGES))
+        except Exception:
+            total = 0
+        if blanks and total and printer_name:
+            # 转成 PDF，逐页渲染，空白页直接不送 → 这是唯一可靠的跳页办法
+            import tempfile
+            fd, tmp = tempfile.mkstemp(suffix=".pdf", prefix="bp_w_")
+            os.close(fd)
+            exported = False
+            try:
+                try:
+                    doc.ExportAsFixedFormat(tmp, 17)      # 17 = PDF
+                    exported = True
+                except Exception:
+                    try:
+                        doc.SaveAs2(tmp, 17)
+                        exported = True
+                    except Exception:
+                        exported = False
+                if not exported or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+                    raise RuntimeError("导出 PDF 失败")
+                try:
+                    doc.Close(0)
+                except Exception:
+                    pass
+                doc = None
+                return print_pdf(tmp, n, orient, printer_name, blank_pages=blanks)
+            finally:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+        page_ranges = _pages_range_text(None, blanks, total) if (blanks and total) else ""
         kwargs = {"Background": False}
         if orient == "fitwidth":
             kwargs["PrintZoomColumn"] = 1
             kwargs["PrintZoomRow"] = 99
+        if page_ranges:
+            kwargs["PageRanges"] = page_ranges
         for _ in range(n):
             hide_print_dialogs()
-            doc.PrintOut(**kwargs)
+            try:
+                doc.PrintOut(**kwargs)
+            except Exception:
+                # 个别版本不认 PageRanges，退回整篇打印，别把任务弄丢
+                kwargs.pop("PageRanges", None)
+                doc.PrintOut(**kwargs)
             hide_print_dialogs()
             if n > 1:
                 time.sleep(1.0)
         note = "已发送 %d 份" % n
         if orient == "fitwidth":
             note += "（按一页宽缩放）"
+        if blanks:
+            note += "（跳过 %d 页空白：%s）" % (len(blanks), "、".join(str(p) for p in blanks))
         return note
     finally:
         if doc is not None:
@@ -269,8 +386,35 @@ def pdf_page_count(path):
         doc.close()
 
 
+def _page_is_blank(doc, index, dpi=24):
+    """把该页按极低 DPI 渲染出来看是不是全白（空白页）；渲染失败就当非空白"""
+    try:
+        from PIL import Image
+        img = doc.render(index, dpi)
+        g = img.convert("L")
+        lo, hi = g.getextrema()
+        return lo >= 245          # 最暗的点都接近白 → 整页空白
+    except Exception:
+        return False
+
+
+def _pdf_blank_pages(doc, limit=400):
+    """返回空白页列表（1 起）；页数过多的文件只查前 limit 页，避免拖慢导入"""
+    out = []
+    n = doc.page_count
+    if n > limit:
+        return []
+    for i in range(n):
+        if _page_is_blank(doc, i):
+            out.append(i + 1)
+    if len(out) >= n:
+        return []                 # 整份都空白，交给调用方按“全空白”处理
+    return out
+
+
 def inspect_pdf(path):
-    data = {"path": path, "name": os.path.basename(path), "sheets": [], "error": None}
+    data = {"path": path, "name": os.path.basename(path), "sheets": [], "error": None,
+            "blank_pages": []}
     doc = None
     try:
         doc = _PdfDoc(path)
@@ -279,6 +423,12 @@ def inspect_pdf(path):
         if page_count:
             w, h = doc.page_size(0)
             landscape = w > h
+        blanks = _pdf_blank_pages(doc)
+        data["blank_pages"] = blanks
+        note = "PDF 按页面渲染后送打印机"
+        if blanks:
+            note = "共 %d 页，第 %s 页是空白页（自动跳过）" % (
+                page_count, "、".join(str(p) for p in blanks))
         data["sheets"].append({
             "index": 1,
             "name": "PDF 全文（%d 页）" % page_count,
@@ -288,7 +438,7 @@ def inspect_pdf(path):
             "print_area": "",
             "rows": None,
             "cols": None,
-            "note": "PDF 按页面渲染后送打印机",
+            "note": note,
         })
     except Exception as e:  # noqa: BLE001
         data["error"] = str(e)
@@ -314,8 +464,11 @@ def _make_dc(printer_name, landscape):
     return win32ui.CreateDCFromHandle(hdc)
 
 
-def print_pdf(path, copies, orient, printer_name, dpi=PDF_RENDER_DPI):
-    """打印 PDF；orient: keep / landscape / portrait / fitwidth；返回说明文字"""
+def print_pdf(path, copies, orient, printer_name, dpi=PDF_RENDER_DPI, blank_pages=None):
+    """打印 PDF；orient: keep / landscape / portrait / fitwidth；返回说明文字
+
+    blank_pages 里的页码（1 起）会被跳过，不送打印。
+    """
     from PIL import ImageWin
     import win32con
 
@@ -323,6 +476,10 @@ def print_pdf(path, copies, orient, printer_name, dpi=PDF_RENDER_DPI):
     try:
         if not doc.page_count:
             raise RuntimeError("这个 PDF 没有页面")
+        skip = {int(p) for p in (blank_pages or ())}
+        keep = [i for i in range(doc.page_count) if (i + 1) not in skip]
+        if not keep:
+            raise RuntimeError("整份 PDF 都是空白页，已跳过")
         w0, h0 = doc.page_size(0)
         base_landscape = w0 > h0
         if orient == "landscape":
@@ -338,7 +495,7 @@ def print_pdf(path, copies, orient, printer_name, dpi=PDF_RENDER_DPI):
                 ph = dc.GetDeviceCaps(win32con.VERTRES)
                 dc.StartDoc("批量打印 - %s" % os.path.basename(path))
                 try:
-                    for i in range(doc.page_count):
+                    for i in keep:
                         img = doc.render(i, dpi)
                         pw_pt, ph_pt = doc.page_size(i)
                         page_landscape = pw_pt > ph_pt
@@ -372,7 +529,9 @@ def print_pdf(path, copies, orient, printer_name, dpi=PDF_RENDER_DPI):
                     dc.EndDoc()
             finally:
                 dc.DeleteDC()
-        note = "已发送 %d 份（%d 页）" % (max(1, int(copies)), doc.page_count)
+        note = "已发送 %d 份（%d 页）" % (max(1, int(copies)), len(keep))
+        if skip:
+            note += "，跳过 %d 页空白" % len(skip)
         return note
     finally:
         doc.close()
